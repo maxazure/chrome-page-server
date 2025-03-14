@@ -32,6 +32,14 @@ async function initBrowser() {
     const executablePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
     
     console.log('Launching browser...');
+    console.log('Using Chrome at:', executablePath);
+    
+    // Create a new temporary directory for this browser instance
+    const tempUserDataDir = path.join(userDataDir, `chrome-${Date.now()}`);
+    console.log('Temporary user data directory:', tempUserDataDir);
+    
+    fs.mkdirSync(tempUserDataDir, { recursive: true });
+    
     browser = await puppeteer.launch({
       executablePath,
       headless: true,
@@ -40,14 +48,43 @@ async function initBrowser() {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--window-size=1920,1080',
+        '--start-maximized',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-infobars',
+        '--ignore-certificate-errors',
+        '--ignore-certificate-errors-spki-list',
         '--disable-gpu',
-        '--window-size=1920x1080'
-      ],
-      defaultViewport: {
-        width: 1920,
-        height: 1080
-      }
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-notifications',
+        '--disable-popup-blocking',
+        '--disable-save-password-bubble',
+        '--disable-translate',
+        '--disable-extensions',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--disable-background-networking',
+        '--metrics-recording-only',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-breakpad',
+        '--disable-component-extensions-with-background-pages',
+        '--disable-features=TranslateUI,BlinkGenPropertyTrees',
+        '--disable-ipc-flooding-protection',
+        '--enable-features=NetworkService,NetworkServiceInProcess',
+        '--force-color-profile=srgb',
+        '--hide-scrollbars',
+        '--ignore-gpu-blacklist',
+        '--mute-audio',
+        '--no-zygote',
+        '--password-store=basic',
+        '--use-gl=swiftshader',
+        '--use-mock-keychain',
+        '--window-position=0,0'
+      ]
     });
 
     console.log('Browser launched successfully');
@@ -57,15 +94,45 @@ async function initBrowser() {
     
     // Handle browser disconnection
     browser.on('disconnected', async () => {
-      console.log('Browser disconnected. Restarting...');
+      console.log('Browser disconnected. Cleaning up...');
+      try {
+        if (fs.existsSync(tempUserDataDir)) {
+          fs.rmSync(tempUserDataDir, { recursive: true, force: true });
+        }
+      } catch (error) {
+        console.warn('Cleanup warning:', error.message);
+      }
       browser = null;
       browserPage = null;
       await initBrowser();
     });
     
+    // 设置页面视口大小
+    await browserPage.setViewport({
+      width: 1920,
+      height: 1080
+    });
+
+    // 设置 User-Agent
+    await browserPage.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+
+    // 注入 JavaScript 来修改 navigator.webdriver
+    await browserPage.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined
+      });
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => [1, 2, 3, 4, 5]
+      });
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en']
+      });
+    });
+    
     return true;
   } catch (error) {
     console.error('Error launching browser:', error);
+    console.error('Error details:', error.stack);
     browser = null;
     browserPage = null;
     return false;
@@ -177,23 +244,62 @@ app.post('/api/get-markdown', async (req, res) => {
     if (!browserPage) {
       browserPage = await browser.newPage();
     }
+
+    // 设置页面超时时间
+    await browserPage.setDefaultNavigationTimeout(60000); // 60秒导航超时
+    await browserPage.setDefaultTimeout(60000); // 60秒默认超时
     
-    // Navigate to the URL
+    // Navigate to the URL with more comprehensive wait conditions
     await browserPage.goto(sanitizedUrl, {
-      waitUntil: 'networkidle2',
-      timeout: 30000
+      waitUntil: ['networkidle0', 'domcontentloaded', 'load'],
+      timeout: 60000
     });
+
+    // 等待页面加载完成
+    await Promise.all([
+      // 等待网络请求完成
+      browserPage.waitForNetworkIdle({ timeout: 60000, idleTime: 5000 }),
+      // 等待页面渲染完成
+      browserPage.evaluate(() => {
+        return new Promise((resolve) => {
+          if (document.readyState === 'complete') {
+            resolve();
+          } else {
+            window.addEventListener('load', resolve);
+          }
+        });
+      }),
+      // 等待动态内容加载
+      new Promise(resolve => setTimeout(resolve, waitTime))
+    ]);
     
-    // Wait for specified time to ensure dynamic content is loaded
-    await browserPage.waitForTimeout(waitTime);
+    // 如果页面有动态加载的内容,等待一段时间确保加载完成
+    await new Promise(resolve => setTimeout(resolve, 2000));
     
-    // If selector provided, wait for it
+    // If selector provided, wait for it with increased timeout
     if (selector) {
       try {
-        await browserPage.waitForSelector(selector, { timeout: 5000 });
+        await browserPage.waitForSelector(selector, { 
+          timeout: 10000,
+          visible: true 
+        });
       } catch (error) {
-        console.warn(`Selector "${selector}" not found, continuing anyway`);
+        console.warn(`Selector "${selector}" not found or not visible, continuing anyway`);
       }
+    }
+    
+    // 检查页面是否完全加载
+    const isPageLoaded = await browserPage.evaluate(() => {
+      return document.readyState === 'complete' && 
+             !document.querySelector('loading') && 
+             !document.querySelector('.loading') &&
+             !document.querySelector('#loading') &&
+             !document.querySelector('[aria-busy="true"]');
+    });
+
+    if (!isPageLoaded) {
+      console.warn('Page may not be fully loaded, waiting additional time...');
+      await new Promise(resolve => setTimeout(resolve, 5000));
     }
     
     // Get the HTML content
@@ -235,6 +341,41 @@ app.post('/api/get-markdown', async (req, res) => {
 
 // Application startup
 async function startServer() {
+  // Kill any existing node processes on port 3000
+  try {
+    await new Promise((resolve) => {
+      require('child_process').exec('lsof -ti:3000 | xargs kill -9', () => resolve());
+    });
+  } catch (error) {
+    console.warn('No existing process on port 3000');
+  }
+
+  // Kill any existing Chrome processes
+  try {
+    if (process.platform === 'darwin') {
+      console.log('Cleaning up any existing Chrome processes...');
+      await new Promise((resolve) => {
+        require('child_process').exec('pkill -f "Google Chrome"', () => resolve());
+      });
+    }
+  } catch (error) {
+    console.warn('Chrome cleanup warning:', error.message);
+  }
+
+  // Clean up chrome-user-data directory
+  try {
+    console.log('Cleaning up user data directory...');
+    if (fs.existsSync(userDataDir)) {
+      fs.rmSync(userDataDir, { recursive: true, force: true });
+    }
+    fs.mkdirSync(userDataDir, { recursive: true });
+  } catch (error) {
+    console.warn('Directory cleanup warning:', error.message);
+  }
+
+  // Wait for cleanup to complete
+  await new Promise(resolve => setTimeout(resolve, 2000));
+
   // Start the server
   app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
@@ -250,6 +391,14 @@ process.on('SIGINT', async () => {
     console.log('Closing browser...');
     await browser.close();
   }
+  // Clean up chrome-user-data directory
+  try {
+    if (fs.existsSync(userDataDir)) {
+      fs.rmSync(userDataDir, { recursive: true, force: true });
+    }
+  } catch (error) {
+    console.warn('Cleanup warning:', error.message);
+  }
   process.exit(0);
 });
 
@@ -258,10 +407,19 @@ process.on('SIGTERM', async () => {
     console.log('Closing browser...');
     await browser.close();
   }
+  // Clean up chrome-user-data directory
+  try {
+    if (fs.existsSync(userDataDir)) {
+      fs.rmSync(userDataDir, { recursive: true, force: true });
+    }
+  } catch (error) {
+    console.warn('Cleanup warning:', error.message);
+  }
   process.exit(0);
 });
 
 // Start the server
 startServer().catch(error => {
   console.error('Failed to start server:', error);
+  process.exit(1);
 });
