@@ -16,3 +16,4 @@ chrome-user-data/
 # Logs
 logs
 *.log
+package-lock.json
